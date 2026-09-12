@@ -1,0 +1,28 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Large Datasets (>100MB)
+data/raw/*.csv
+data/raw/*.pcap
+!data/raw/.gitkeep
+
+# Local Logs and SQLite Databases
+logs/*.db
+logs/*.sqlite3
+!logs/.gitkeep
+
+# Streamlit Local Config / Credentials
+.streamlit/credentials.toml
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
