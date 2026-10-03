@@ -19,28 +19,47 @@ if str(PROJECT_ROOT) not in sys.path:
 
 def _resolve_db_path(db_path: Union[str, Path]) -> Path:
     """Resolves relative database paths relative to the project root directory."""
+    if db_path is None:
+        raise ValueError("Database path cannot be None")
     path = Path(db_path)
     if not path.is_absolute():
         path = PROJECT_ROOT / path
     return path
 
 
-def init_db(db_path: Union[str, Path] = "logs/audit.db") -> None:
+def get_connection(
+    db_path: Union[str, Path] = "logs/audit.db",
+    timeout: float = 30.0,
+) -> sqlite3.Connection:
+    """Creates a connection to the audit database with WAL mode and busy timeout configured."""
+    resolved_path = _resolve_db_path(db_path)
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(resolved_path, timeout=timeout)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")
+    return conn
+
+
+def init_db(db_path: Union[str, Path] = "logs/audit.db") -> str:
     """Creates the audit database and table if they do not exist.
 
-    Ensures the schema is up-to-date, including backward-compatible addition
-    of the 'source_agent' column if migrating from an older schema.
+    Ensures the schema is up-to-date (including 'source_agent' and 'llm_explanation'),
+    and configures SQLite Write-Ahead Logging (WAL) for safe multi-process concurrency.
 
     Parameters
     ----------
     db_path : str or Path, optional
         Filepath for the SQLite database (default: 'logs/audit.db').
-    """
-    resolved_path = _resolve_db_path(db_path)
-    resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with sqlite3.connect(resolved_path) as conn:
+    Returns
+    -------
+    str
+        Active SQLite journal mode (e.g. 'wal').
+    """
+    with get_connection(db_path) as conn:
         cursor = conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL;")
+        journal_mode = cursor.fetchone()[0]
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS audit_log (
@@ -70,6 +89,7 @@ def init_db(db_path: Union[str, Path] = "logs/audit.db") -> None:
             cursor.execute("ALTER TABLE audit_log ADD COLUMN llm_explanation TEXT")
 
         conn.commit()
+        return str(journal_mode)
 
 
 def log_decision(
@@ -108,10 +128,9 @@ def log_decision(
     int
         The auto-generated primary key ID of the inserted row.
     """
-    resolved_path = _resolve_db_path(db_path)
     now_utc = datetime.now(timezone.utc).isoformat()
 
-    with sqlite3.connect(resolved_path) as conn:
+    with get_connection(db_path) as conn:
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -173,7 +192,7 @@ def get_recent_decisions(
     if not resolved_path.exists():
         return []
 
-    with sqlite3.connect(resolved_path) as conn:
+    with get_connection(resolved_path) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute(
@@ -224,7 +243,8 @@ if __name__ == "__main__":
         sys.exit(1)
 
     print("Initializing audit log database...")
-    init_db()
+    jmode = init_db()
+    print(f"WAL Confirmation: PRAGMA journal_mode = {jmode.upper()}")
 
     print(f"Loading model from: {model_path} ...")
     model = joblib.load(model_path)

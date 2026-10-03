@@ -22,7 +22,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from modules.audit_log import get_recent_decisions
+from modules.audit_log import get_connection, get_recent_decisions
 
 DB_PATH = PROJECT_ROOT / "logs" / "audit.db"
 
@@ -45,7 +45,7 @@ def get_full_audit_metrics(db_path: Path) -> Dict[str, int]:
         }
 
     try:
-        with sqlite3.connect(db_path) as conn:
+        with get_connection(db_path) as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
@@ -135,9 +135,10 @@ def main() -> None:
         st.info("No audit records found.")
         return
 
-    # Prepare DataFrame with required columns in exact specified order
+    # Prepare DataFrame with required columns including source_agent
     ordered_columns = [
         "timestamp",
+        "source_agent",
         "true_label",
         "detection_prediction",
         "detection_confidence",
@@ -170,25 +171,28 @@ def main() -> None:
         selected_event_id = st.selectbox(
             "Select an Event ID to inspect complete audit trail & reasoning:",
             options=event_options,
-            format_func=lambda eid: f"Event #{eid} — {next((r['gate_decision'] + ' (' + r['final_action'] + ')' for r in recent_records if r['event_id'] == eid), '')}",
+            format_func=lambda eid: f"Event #{eid} — [{next((r.get('source_agent', 'NETWORK') for r in recent_records if r['event_id'] == eid), 'NETWORK')}] {next((r['gate_decision'] + ' (' + r['final_action'] + ')' for r in recent_records if r['event_id'] == eid), '')}",
         )
 
         selected_record = next((r for r in recent_records if r["event_id"] == selected_event_id), None)
         if selected_record:
             st.markdown(f"#### Audit Record for Event #{selected_event_id}")
 
-            meta_col1, meta_col2, meta_col3 = st.columns(3)
+            meta_col1, meta_col2, meta_col3, meta_col4 = st.columns(4)
             with meta_col1:
                 st.write(f"**Timestamp (UTC):** `{selected_record.get('timestamp')}`")
-                st.write(f"**True Ground-Truth:** `{selected_record.get('true_label')}`")
+                st.write(f"**Source Domain:** `{selected_record.get('source_agent', 'NETWORK')}`")
             with meta_col2:
-                conf = selected_record.get("detection_confidence", 0.0)
-                st.write(f"**ML Prediction:** `{selected_record.get('detection_prediction')}` (Confidence: `{conf:.4f}`)")
+                st.write(f"**True Ground-Truth:** `{selected_record.get('true_label')}`")
                 st.write(f"**Proposed Action:** `{selected_record.get('proposed_action')}`")
             with meta_col3:
+                conf = selected_record.get("detection_confidence", 0.0)
+                st.write(f"**ML Prediction:** `{selected_record.get('detection_prediction')}` (Confidence: `{conf:.4f}`)")
                 r_score = selected_record.get("risk_score", 0.0)
                 st.write(f"**Risk Score:** `{r_score:.4f}` ({selected_record.get('risk_level')})")
+            with meta_col4:
                 st.write(f"**Gate Decision:** `{selected_record.get('gate_decision')}`")
+                st.write(f"**Final Action:** `{selected_record.get('final_action')}`")
 
             st.markdown("**Full Gate Reasoning:**")
             decision = selected_record.get("gate_decision")
@@ -198,6 +202,11 @@ def main() -> None:
                 st.warning(f"⚠️ **Pending Human Approval**: {reason_text}")
             else:
                 st.success(f"✅ **Auto-Execution Permitted**: {reason_text}")
+
+            llm_exp = selected_record.get("llm_explanation")
+            if llm_exp:
+                st.markdown("**🧠 LLM Incident Explanation (Read-Only Human Advisory):**")
+                st.info(llm_exp)
 
 
 if __name__ == "__main__":
