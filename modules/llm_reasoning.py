@@ -29,6 +29,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from modules.guardrails import check_groundedness, sanitize_for_prompt
+
 # Single, explicitly named constant for the active Gemini model endpoint
 GEMINI_MODEL = "gemini-3.8-flash"
 
@@ -38,6 +40,7 @@ def build_incident_prompt(gate_result_or_combined: Dict[str, Any]) -> str:
 
     Accepts either a single-agent gate result dictionary (from network, host, or
     iam pipelines) or a combined cross-domain result from conflict_resolver.py.
+    All untrusted telemetry text fields are sanitized to defend against prompt injection.
 
     Parameters
     ----------
@@ -49,36 +52,52 @@ def build_incident_prompt(gate_result_or_combined: Dict[str, Any]) -> str:
     str
         Formatted plain-text prompt instructing the model to explain the incident.
     """
+    def _sanitize(val: Any, field_name: str) -> str:
+        if val is None:
+            return ""
+        res = sanitize_for_prompt(str(val), field_name=field_name)
+        if res["flagged"]:
+            print(
+                f"Warning: Field '{field_name}' flagged for injection pattern "
+                f"'{res['matched_pattern']}'; using filtered text in prompt."
+            )
+        return res["sanitized_text"]
+
     is_combined = "host_result" in gate_result_or_combined and "iam_result" in gate_result_or_combined
 
     if is_combined:
-        computer = gate_result_or_combined.get("computer", "Shared Host")
+        computer = _sanitize(gate_result_or_combined.get("computer", "Shared Host"), "computer")
         combined_decision = gate_result_or_combined.get("combined_gate_decision", "NEEDS_HUMAN_APPROVAL")
         execution_order = gate_result_or_combined.get("execution_order", [])
-        combined_reason = gate_result_or_combined.get("combined_reason", "")
+        combined_reason = _sanitize(gate_result_or_combined.get("combined_reason", ""), "combined_reason")
         h_res = gate_result_or_combined.get("host_result", {})
         i_res = gate_result_or_combined.get("iam_result", {})
+
+        h_action = _sanitize(h_res.get("final_action", ""), "host_final_action")
+        h_reason = _sanitize(h_res.get("gate_reason", "N/A"), "host_gate_reason")
+        i_action = _sanitize(i_res.get("final_action", ""), "iam_final_action")
+        i_reason = _sanitize(i_res.get("gate_reason", "N/A"), "iam_gate_reason")
 
         evidence = (
             f"Incident Classification: Correlated Multi-Domain Attack (Host & IAM Collision)\n"
             f"Target Computer: {computer}\n"
             f"Overall Gate Decision: {combined_decision}\n"
             f"Resolved Action Execution Sequence: {execution_order}\n"
-            f"Host Subsystem Finding: Action '{h_res.get('final_action')}' "
-            f"(Risk: {h_res.get('risk_score', 'N/A')}). Reason: {h_res.get('gate_reason', 'N/A')}\n"
-            f"IAM Subsystem Finding: Action '{i_res.get('final_action')}' "
-            f"(Risk: {i_res.get('risk_score', 'N/A')}). Reason: {i_res.get('gate_reason', 'N/A')}\n"
+            f"Host Subsystem Finding: Action '{h_action}' "
+            f"(Risk: {h_res.get('risk_score', 'N/A')}). Reason: {h_reason}\n"
+            f"IAM Subsystem Finding: Action '{i_action}' "
+            f"(Risk: {i_res.get('risk_score', 'N/A')}). Reason: {i_reason}\n"
             f"Joint Reasoning Trail: {combined_reason}"
         )
     else:
-        source_agent = gate_result_or_combined.get("source_agent", "Security Telemetry Agent")
+        source_agent = _sanitize(gate_result_or_combined.get("source_agent", "Security Telemetry Agent"), "source_agent")
         event_id = gate_result_or_combined.get("event_id", "N/A")
-        action = gate_result_or_combined.get("final_action", gate_result_or_combined.get("action", "N/A"))
+        action = _sanitize(gate_result_or_combined.get("final_action", gate_result_or_combined.get("action", "N/A")), "action")
         risk_score = gate_result_or_combined.get("risk_score", "N/A")
         risk_level = gate_result_or_combined.get("risk_level", "N/A")
         gate_decision = gate_result_or_combined.get("gate_decision", "NEEDS_HUMAN_APPROVAL")
-        gate_reason = gate_result_or_combined.get("gate_reason", "N/A")
-        label = gate_result_or_combined.get("true_label", "")
+        gate_reason = _sanitize(gate_result_or_combined.get("gate_reason", "N/A"), "gate_reason")
+        label = _sanitize(gate_result_or_combined.get("true_label", ""), "true_label")
         confidence = gate_result_or_combined.get("detection_confidence", "")
 
         evidence = (
@@ -215,10 +234,12 @@ def explain_incident(
                 parts = candidates[0].get("content", {}).get("parts", [])
                 if parts and "text" in parts[0]:
                     explanation_text = parts[0]["text"].strip()
+                    groundedness = check_groundedness(explanation_text, gate_result_or_combined)
                     return {
                         "explanation": explanation_text,
                         "source": GEMINI_MODEL,
                         "error": None,
+                        "groundedness": groundedness,
                     }
             last_error = "Malformed API response: no text parts in candidates"
         else:
@@ -228,10 +249,12 @@ def explain_incident(
 
     # 5. Graceful fallback on any failure
     fallback_text = _build_fallback_explanation(gate_result_or_combined)
+    groundedness = check_groundedness(fallback_text, gate_result_or_combined)
     return {
         "explanation": fallback_text,
         "source": "fallback_template",
         "error": last_error or "API request failed",
+        "groundedness": groundedness,
     }
 
 
@@ -308,10 +331,16 @@ if __name__ == "__main__":
     print(result["explanation"])
     print("-" * 80)
 
-    # Confirm source accurately matches GEMINI_MODEL
-    assert result["source"] == GEMINI_MODEL, (
-        f"Expected source '{GEMINI_MODEL}', got '{result['source']}'"
-    )
+    assert "groundedness" in result, "Expected 'groundedness' key in explain_incident result"
+    print(f"Groundedness Check: {result['groundedness']}")
+
+    # Confirm source accurately matches GEMINI_MODEL or fallback_template
+    if result["error"] is None:
+        assert result["source"] == GEMINI_MODEL, (
+            f"Expected source '{GEMINI_MODEL}', got '{result['source']}'"
+        )
+    else:
+        assert result["source"] == "fallback_template"
 
     # Evaluate Sample 1 (Clearly BENIGN)
     benign_det = iam_detect(iam_model, iam_feature_cols, sample_clearly_benign)

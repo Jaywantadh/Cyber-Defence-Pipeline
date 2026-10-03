@@ -56,7 +56,7 @@ def evaluate_gate(risk_result: Dict[str, Any]) -> Dict[str, Any]:
         Dictionary with 'event_id', 'gate_decision' ("AUTO_EXECUTE" | "NEEDS_HUMAN_APPROVAL"),
         'final_action', and 'gate_reason'.
     """
-    event_id = risk_result["event_id"]
+    event_id = risk_result.get("event_id", "UNKNOWN")
     action = risk_result.get("action", "NO_ACTION")
 
     # Fail-closed check: if 'risk_score' is missing entirely from upstream risk_result, force NEEDS_HUMAN_APPROVAL
@@ -87,7 +87,16 @@ def evaluate_gate(risk_result: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     # 2. Maximum consequence policy override: actions with maximum severity always require human review
-    severity_weight = ACTION_SEVERITY_WEIGHTS.get(action, 0.5)
+    if action not in ACTION_SEVERITY_WEIGHTS:
+        print(
+            f"Warning: Unrecognized action '{action}' encountered in safety gate (event_id={event_id}). "
+            f"Defaulting to maximum severity weight (1.0) for fail-closed safety."
+        )
+        # Unrecognized actions represent novel or malformed proposals; defaulting to 1.0 (fail-closed)
+        severity_weight = 1.0
+    else:
+        severity_weight = ACTION_SEVERITY_WEIGHTS[action]
+
     if severity_weight >= ALWAYS_REVIEW_SEVERITY:
         return {
             "event_id": event_id,
@@ -206,4 +215,86 @@ if __name__ == "__main__":
     assert forced_gate["gate_decision"] == "NEEDS_HUMAN_APPROVAL"
     assert "missing" in forced_gate["gate_reason"].lower()
     print("Confirmed: Missing risk_score resulted in NEEDS_HUMAN_APPROVAL (fail-closed).")
+
+    print("\n" + "=" * 80)
+    print("ADVERSARIAL GATE-BYPASS CHECK (1,000 ADVERSARIAL INPUTS)")
+    print("=" * 80)
+    from collections import Counter
+    import contextlib
+    import io
+    import random
+
+    random.seed(42)
+    known_actions = ["NO_ACTION", "FLAG_FOR_REVIEW", "TERMINATE_PROCESS", "ISOLATE_FLOW", "RESET_CREDENTIALS"]
+    unknown_actions = ["CUSTOM_BYPASS", "MALICIOUS_OVERRIDE", "UNKNOWN_OP", "", "NULL_ACTION", "ADMIN_DISABLE_GATE"]
+    all_test_actions = known_actions + unknown_actions
+
+    eval_results = []
+    failures = []
+    for _ in range(1000):
+        r_dict = {}
+        if random.random() > 0.15:
+            r_dict["event_id"] = random.randint(1000, 999999)
+        r_prob = random.random()
+        if r_prob > 0.25:
+            r_dict["risk_score"] = round(random.uniform(0.0, 1.0), 4)
+        elif r_prob > 0.1:
+            r_dict["risk_score"] = None
+        if random.random() > 0.15:
+            r_dict["action"] = random.choice(all_test_actions)
+
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                res = evaluate_gate(r_dict)
+            dec = res.get("gate_decision")
+            eval_results.append((r_dict, dec))
+            if dec not in ("AUTO_EXECUTE", "NEEDS_HUMAN_APPROVAL"):
+                failures.append((r_dict, res, f"Invalid decision: {dec}"))
+        except Exception as exc:
+            eval_results.append((r_dict, "EXCEPTION"))
+            failures.append((r_dict, None, f"Uncaught exception: {exc}"))
+
+    # Categorize generated test cases into requirements (a) through (f)
+    cat_a = [(c, d) for c, d in eval_results if c.get("action") in known_actions and isinstance(c.get("risk_score"), (int, float))]
+    cat_b = [(c, d) for c, d in eval_results if "action" in c and c["action"] not in known_actions and isinstance(c.get("risk_score"), (int, float)) and c["risk_score"] < 0.7]
+    cat_c = [(c, d) for c, d in eval_results if "action" in c and c["action"] not in known_actions and isinstance(c.get("risk_score"), (int, float)) and c["risk_score"] >= 0.7]
+    cat_d = [(c, d) for c, d in eval_results if "risk_score" not in c or c.get("risk_score") is None]
+    cat_e = [(c, d) for c, d in eval_results if "action" not in c]
+    cat_f = [(c, d) for c, d in eval_results if "event_id" not in c]
+
+    categories = [
+        ("(a) Known action + valid risk_score", cat_a),
+        ("(b) Unknown/unrecognized action + risk_score < 0.7", cat_b),
+        ("(c) Unknown/unrecognized action + risk_score >= 0.7", cat_c),
+        ("(d) Missing risk_score key (omitted or None)", cat_d),
+        ("(e) Missing action key", cat_e),
+        ("(f) Missing event_id key", cat_f),
+    ]
+
+    print("\n--- CATEGORY BREAKDOWN ACROSS 1,000 ADVERSARIAL CASES ---")
+    for name, items in categories:
+        counts = Counter(d for _, d in items)
+        auto_cnt = counts.get("AUTO_EXECUTE", 0)
+        human_cnt = counts.get("NEEDS_HUMAN_APPROVAL", 0)
+        other_cnt = len(items) - auto_cnt - human_cnt
+        print(f"  {name:52s} : Count = {len(items):3d} | AUTO_EXECUTE: {auto_cnt:3d} | NEEDS_HUMAN_APPROVAL: {human_cnt:3d}" + (f" | OTHER: {other_cnt}" if other_cnt else ""))
+
+    print(f"\n--- CATEGORY (b) ISOLATION: UNRECOGNIZED ACTION + LOW RISK SCORE (< 0.7) [Total: {len(cat_b)}] ---")
+    for idx, (inp, dec) in enumerate(cat_b, 1):
+        print(f"  [{idx:03d}] Input: {inp} -> gate_decision: {dec}")
+
+    # Verify category (b) fail-closed behavior
+    cat_b_auto = [inp for inp, dec in cat_b if dec == "AUTO_EXECUTE"]
+    if cat_b_auto:
+        print(f"\nCRITICAL FAIL-OPEN GAP: {len(cat_b_auto)} category (b) cases returned AUTO_EXECUTE!")
+    else:
+        print(f"\nConfirmed: 100% of category (b) cases ({len(cat_b)}/{len(cat_b)}) returned NEEDS_HUMAN_APPROVAL (fail-closed).")
+
+    if not failures and not cat_b_auto:
+        print("\nPASSED: gate never returned an invalid state across 1000 adversarial inputs")
+    else:
+        print(f"\nFAILED: {len(failures)} adversarial cases failed:")
+        for r_in, r_out, err in failures[:5]:
+            print(f"  Input: {r_in} -> Output: {r_out} -> Error: {err}")
+        assert False, f"{len(failures)} adversarial test cases failed"
 
