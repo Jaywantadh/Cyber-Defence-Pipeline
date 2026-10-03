@@ -18,7 +18,15 @@ from modules.dataset_loader import load_raw_data
 from modules.detection import detect, prepare_training_data
 from modules.ingestion import normalize_events
 from modules.network_agent import propose_action
-from modules.risk_engine import HIGH_RISK_THRESHOLD, compute_risk_score
+from modules.risk_engine import (
+    ACTION_SEVERITY_WEIGHTS,
+    HIGH_RISK_THRESHOLD,
+    compute_risk_score,
+)
+
+# Named constant for maximum consequence policy enforcement.
+# Actions carrying this severity weight always require human review regardless of detection confidence.
+ALWAYS_REVIEW_SEVERITY: float = 1.0
 
 # Synchronized threshold for autonomous execution boundary.
 # Actions with risk scores at or above this bound require human approval.
@@ -29,9 +37,11 @@ def evaluate_gate(risk_result: Dict[str, Any]) -> Dict[str, Any]:
     """Evaluates whether a proposed action can be automatically executed or blocked for human review.
 
     Safety Logic:
-        Higher risk implies GREATER caution:
+        Higher risk and severity imply GREATER caution:
         - If action is "NO_ACTION": AUTO_EXECUTE
-        - If risk_score >= RISK_AUTO_EXECUTE_BOUND: NEEDS_HUMAN_APPROVAL (blocked)
+        - If action severity weight == ALWAYS_REVIEW_SEVERITY (1.0): NEEDS_HUMAN_APPROVAL
+          (maximum-severity actions always receive human review, regardless of confidence)
+        - If risk_score >= RISK_AUTO_EXECUTE_BOUND (0.7): NEEDS_HUMAN_APPROVAL (blocked)
         - If risk_score < RISK_AUTO_EXECUTE_BOUND: AUTO_EXECUTE (allowed)
 
     Parameters
@@ -48,7 +58,24 @@ def evaluate_gate(risk_result: Dict[str, Any]) -> Dict[str, Any]:
     """
     event_id = risk_result["event_id"]
     action = risk_result.get("action", "NO_ACTION")
-    risk_score = risk_result.get("risk_score", 0.0)
+
+    # Fail-closed check: if 'risk_score' is missing entirely from upstream risk_result, force NEEDS_HUMAN_APPROVAL
+    if "risk_score" not in risk_result or risk_result["risk_score"] is None:
+        print(
+            f"Warning: 'risk_score' key missing from risk_result (event_id={event_id}). "
+            f"Defaulting to NEEDS_HUMAN_APPROVAL for fail-closed safety."
+        )
+        return {
+            "event_id": event_id,
+            "gate_decision": "NEEDS_HUMAN_APPROVAL",
+            "final_action": action,
+            "gate_reason": (
+                "Upstream 'risk_score' was missing from risk_result dictionary; "
+                "failing closed to NEEDS_HUMAN_APPROVAL as a safety default, not a real risk assessment."
+            ),
+        }
+
+    risk_score = round(float(risk_result["risk_score"]), 4)
 
     # 1. No action required
     if action == "NO_ACTION":
@@ -59,7 +86,21 @@ def evaluate_gate(risk_result: Dict[str, Any]) -> Dict[str, Any]:
             "gate_reason": "No action required",
         }
 
-    # 2. Safety Gate evaluation: High risk requires human authorization
+    # 2. Maximum consequence policy override: actions with maximum severity always require human review
+    severity_weight = ACTION_SEVERITY_WEIGHTS.get(action, 0.5)
+    if severity_weight >= ALWAYS_REVIEW_SEVERITY:
+        return {
+            "event_id": event_id,
+            "gate_decision": "NEEDS_HUMAN_APPROVAL",
+            "final_action": action,
+            "gate_reason": (
+                f"Action '{action}' carries maximum severity weight ({ALWAYS_REVIEW_SEVERITY}); "
+                f"requires human approval regardless of detection confidence, per policy: "
+                f"the most consequential actions always receive human review."
+            ),
+        }
+
+    # 3. Safety Gate evaluation: High risk requires human authorization
     if risk_score >= RISK_AUTO_EXECUTE_BOUND:
         return {
             "event_id": event_id,
@@ -150,3 +191,19 @@ if __name__ == "__main__":
             print(f"  Safety Gate Result   : {gate_result}")
         else:
             print(f"\nWarning: Test sample for {category} could not be found.")
+
+    print("\n" + "=" * 80)
+    print("FAIL-CLOSED TEST: MISSING 'risk_score' KEY DEFAULTS TO NEEDS_HUMAN_APPROVAL")
+    print("=" * 80)
+    malformed_risk_result = {
+        "event_id": 88888,
+        "action": "FLAG_FOR_REVIEW",
+        # 'risk_score' key deliberately omitted
+    }
+    forced_gate = evaluate_gate(malformed_risk_result)
+    print(f"Input Dict  : {malformed_risk_result}")
+    print(f"Gate Result : {forced_gate}")
+    assert forced_gate["gate_decision"] == "NEEDS_HUMAN_APPROVAL"
+    assert "missing" in forced_gate["gate_reason"].lower()
+    print("Confirmed: Missing risk_score resulted in NEEDS_HUMAN_APPROVAL (fail-closed).")
+

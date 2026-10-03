@@ -3,3 +3,5 @@ scikit-learn
 joblib
 streamlit
 sqlalchemy
+python-dotenv
+requests

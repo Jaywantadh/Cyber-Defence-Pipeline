@@ -22,6 +22,8 @@ from modules.network_agent import propose_action
 # Action severity weights reflecting operational impact of autonomous actions
 ACTION_SEVERITY_WEIGHTS: Dict[str, float] = {
     "ISOLATE_FLOW": 1.0,
+    "TERMINATE_PROCESS": 1.0,
+    "RESET_CREDENTIALS": 1.0,
     "FLAG_FOR_REVIEW": 0.5,
 }
 
@@ -68,7 +70,15 @@ def compute_risk_score(action_proposal: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     detection_confidence = float(action_proposal.get("detection_confidence", 0.0))
-    severity_weight = ACTION_SEVERITY_WEIGHTS.get(action, 0.5)
+    # Unrecognized actions default to 1.0 (fail-closed) so unknown actions are never treated as low/mid-risk.
+    if action in ACTION_SEVERITY_WEIGHTS:
+        severity_weight = ACTION_SEVERITY_WEIGHTS[action]
+    else:
+        print(
+            f"Warning: Unrecognized action '{action}' encountered in risk engine (event_id={event_id}). "
+            f"Defaulting to maximum severity weight (1.0) for fail-closed safety."
+        )
+        severity_weight = 1.0
 
     # Compute raw risk score and clamp to [0.0, 1.0]
     raw_score = detection_confidence * severity_weight
@@ -158,3 +168,19 @@ if __name__ == "__main__":
             print(f"  Risk Engine Result   : {risk_result}")
         else:
             print(f"\nWarning: Test sample for {category} could not be found.")
+
+    print("\n" + "=" * 75)
+    print("FAIL-CLOSED TEST: UNRECOGNIZED ACTION STRING DEFAULTS TO SEVERITY 1.0")
+    print("=" * 75)
+    unrecognized_proposal = {
+        "event_id": 99999,
+        "action": "CUSTOM_UNKNOWN_ACTION",
+        "detection_confidence": 0.85,
+    }
+    unrecognized_risk = compute_risk_score(unrecognized_proposal)
+    print(f"Action Proposal : {unrecognized_proposal}")
+    print(f"Risk Result     : {unrecognized_risk}")
+    assert unrecognized_risk["risk_score"] == 0.85, f"Expected risk_score 0.85, got {unrecognized_risk['risk_score']}"
+    assert unrecognized_risk["risk_level"] == "HIGH"
+    print("Confirmed: Unrecognized action received maximum severity weight 1.0 (fail-closed).")
+

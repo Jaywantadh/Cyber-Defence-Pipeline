@@ -30,6 +30,7 @@ from modules.safety_gate import evaluate_gate
 def run_pipeline_on_event(
     event: Dict[str, Any],
     model: Any,
+    source_agent: str,
     errors_list: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Chains all pipeline stages for ONE normalized event:
@@ -42,6 +43,8 @@ def run_pipeline_on_event(
         Normalized event dict from ingestion.
     model : Any
         Trained threat detection classifier.
+    source_agent : str
+        Source domain identifier (e.g. "NETWORK").
     errors_list : Optional[List[Dict[str, Any]]], optional
         List to collect any per-event processing exceptions.
 
@@ -56,7 +59,14 @@ def run_pipeline_on_event(
         act_result = propose_action(det_result, event)
         risk_result = compute_risk_score(act_result)
         gate_result = evaluate_gate(risk_result)
-        log_decision(event, det_result, act_result, risk_result, gate_result)
+        log_decision(
+            event=event,
+            detection_result=det_result,
+            action_proposal=act_result,
+            risk_result=risk_result,
+            gate_result=gate_result,
+            source_agent=source_agent,
+        )
 
         result = dict(gate_result)
         result["true_label"] = event.get("label")
@@ -137,7 +147,7 @@ def run_batch(sample_size: int = 5000, random_state: int = 42) -> None:
     start_time = time.time()
 
     for idx, event in enumerate(sampled_events):
-        res = run_pipeline_on_event(event, model, errors_list=errors)
+        res = run_pipeline_on_event(event, model, source_agent="NETWORK", errors_list=errors)
         if res is not None:
             processed_results.append(res)
 
