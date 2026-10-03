@@ -65,8 +65,8 @@ def get_full_audit_metrics(db_path: Path) -> Dict[str, int]:
                     "auto_execute": int(row[2]),
                     "high_risk": int(row[3]),
                 }
-    except sqlite3.OperationalError:
-        pass
+    except sqlite3.OperationalError as exc:
+        st.error(f"❌ Database error: Could not read audit database ({exc})")
 
     return {
         "total_events": 0,
@@ -205,7 +205,8 @@ def main() -> None:
 
             llm_exp = selected_record.get("llm_explanation")
             if llm_exp:
-                st.markdown("**🧠 LLM Incident Explanation (Read-Only Human Advisory):**")
+                st.markdown("---")
+                st.markdown("#### 🧠 AI Incident Explanation")
                 st.info(llm_exp)
 
 
